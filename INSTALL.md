@@ -6,9 +6,12 @@ HISE-Pro 啟動與測試標準作業程序 (SOP)
 
 **前置要求：**
 * 作業系統：**Linux** 或 **Windows (WSL2)**
-* Python 版本：`>= 3.9`
-* CUDA 版本：`>= 12.1`
-步驟 1：安裝 PyTorch
+* **Python 版本**：`>= 3.9`
+* **CUDA 版本**：`>= 12.1`
+
+### 步驟 1：安裝 PyTorch
+使用以下指令安裝基礎環境：
+
 ```bash
 pip install torch torchvision torchaudio --index-url [https://download.pytorch.org/whl/cu121](https://download.pytorch.org/whl/cu121)
 
