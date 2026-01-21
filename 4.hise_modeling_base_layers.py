@@ -22,13 +22,11 @@ class HamiltonianAttention(nn.Module):
         self.w_v = nn.Linear(config.d_model, config.d_model, bias=False)
         self.out_proj = nn.Linear(config.d_model, config.d_model)
 
-
     def forward(self, h, mask=None):
         B, T, C = h.size()
         q = self.w_q(h).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         k = self.w_k(h).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = self.w_v(h).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-
 
         # Potential Gradient Calculation (Hamiltonian Dynamics)
         # Scaled Dot-Product Attention
@@ -37,10 +35,8 @@ class HamiltonianAttention(nn.Module):
         # Apply Temperature (Annealing)
         scores = scores / self.tau 
 
-
         if mask is not None:
             scores = scores + mask
-
 
         attn_weights = torch.softmax(scores, dim=-1)
         
@@ -64,12 +60,9 @@ class SoftTCMLayer(nn.Module):
         self.force_field = HamiltonianAttention(config)
         self.norm = nn.LayerNorm(config.d_model)
 
-
         # Low-Rank Manifold Projectors (U: Down to Manifold, V: Up to State Space)
-        # Reduces dimensionality for efficient symplectic integration
         self.U = nn.Linear(config.d_model, config.d_inertial, bias=False)
         self.V = nn.Linear(config.d_inertial, config.d_model, bias=False)
-
 
         # Dissipation Control (Friction)
         self.gamma_net = nn.Sequential(
@@ -82,7 +75,6 @@ class SoftTCMLayer(nn.Module):
         self.gearbox = CognitiveGearbox(config)
         
         # System 2 Logic Gate (Spectral-Riemannian Coupling)
-        # Only activated when Mass > Threshold (Heavy Thought Mode)
         self.logic_gate = nn.Sequential(
             nn.Linear(config.d_model, config.d_model * 4),
             nn.GELU(),
@@ -96,12 +88,13 @@ class SoftTCMLayer(nn.Module):
             nn.Linear(4 * config.d_model, config.d_model)
         )
 
-
     def forward(self, h, mask=None, past_momentum=None):
         """
         Symplectic Forward Pass with Differentiable Physics Metrics.
+        Handles both Inference (Cached) and Training (Sequential Scan).
         """
         h_norm = self.norm(h)
+        B, T, C = h.shape
         
         # 1. Total Force Calculation
         f_attn = self.force_field(h_norm, mask)
@@ -111,33 +104,47 @@ class SoftTCMLayer(nn.Module):
         # 2. Projection to Inertial Manifold (Phase Space)
         f_proj = self.U(f_total) 
         
-        # 3. FSI Calculation (Fisher Semantic Information)
-        # [CRITICAL FIX] Removed 'with torch.no_grad():'
-        # Now FSI is part of the computational graph, allowing the Physics Loss
-        # to backpropagate gradients to 'h' and 'f_proj'.
+        # 3. FSI Calculation (Differentiable!)
+        # Now part of the computational graph, enabling Physics Loss backprop.
         h_mag = torch.norm(h_norm, p=2, dim=-1)
         f_mag = torch.norm(f_proj, p=2, dim=-1)
         
         # FSI = Signal / (Noise + epsilon)
-        # Represents the ratio of State Magnitude to Force Magnitude
         fsi = h_mag / (2 * f_mag + 1e-6)
 
-
         # 4. Cognitive Gearbox (Determine Mass & Epsilon)
-        # Mass is now dependent on differentiable FSI
         mass_t, epsilon_t, is_system_2 = self.gearbox(h, fsi)
         gamma = self.gamma_net(h_norm)
 
-
-        if past_momentum is None:
-            # Initialize momentum as zero (Cold Start)
-            past_momentum = torch.zeros_like(f_proj)
-
-
-        # 5. Fused Symplectic Update (via Triton)
-        # Updates momentum considering variable Mass
-        # This calls the Autograd-supported kernel we fixed in Step 1
-        m_new = fused_agi_update(past_momentum, f_proj, mass_t, epsilon_t, gamma)
+        # 5. Symplectic Integration (Momentum Update)
+        if past_momentum is not None:
+            # === Inference Mode (Cached) ===
+            # Simply update the state from the previous step
+            m_new = fused_agi_update(past_momentum, f_proj, mass_t, epsilon_t, gamma)
+        
+        else:
+            # === Training Mode (Sequential Scan) ===
+            # We must simulate the time evolution step-by-step to build memory.
+            # Initialize momentum (Cold Start)
+            m_curr = torch.zeros(B, 1, self.config.d_inertial, device=h.device, dtype=h.dtype)
+            m_outputs = []
+            
+            # Recurrent Loop (Python-level scan)
+            # Note: For production optimization, this should be replaced by a 
+            # Parallel Scan (Prefix Sum) kernel in Triton.
+            for t in range(T):
+                # Slice current time step inputs [Batch, 1, Dim]
+                f_t = f_proj[:, t:t+1, :]
+                mass_t_step = mass_t[:, t:t+1, :]
+                eps_t_step = epsilon_t[:, t:t+1, :]
+                gamma_t = gamma[:, t:t+1, :]
+                
+                # Update Momentum: m_t = Step(m_{t-1}, Inputs_t)
+                m_curr = fused_agi_update(m_curr, f_t, mass_t_step, eps_t_step, gamma_t)
+                m_outputs.append(m_curr)
+            
+            # Concatenate all time steps back to [Batch, Seq, Dim]
+            m_new = torch.cat(m_outputs, dim=1)
         
         # 6. Velocity Injection & Position Update
         # q_{t+1} = q_t + epsilon * (V @ m_{t+1})
@@ -148,12 +155,11 @@ class SoftTCMLayer(nn.Module):
         # Soft Gating: Applies logic correction based on Mass excess
         sys2_correction = self.logic_gate(self.norm(h_new))
         
-        # Differentiable Gate: Allows learning the threshold behavior
+        # Differentiable Gate
         gate = torch.sigmoid(mass_t - self.config.system2_threshold) 
         h_final = h_new + gate * sys2_correction
         
-        # 8. Auxiliary Drift (Standard ResNet connection)
+        # 8. Auxiliary Drift (ResNet connection)
         h_final = h_final + self.mlp(self.norm(h_final))
-
 
         return h_final, m_new, fsi
