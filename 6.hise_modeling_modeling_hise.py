@@ -1,23 +1,29 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Optional, Tuple, Union, List
-from transformers import PreTrainedModel, CausalLMOutputWithCrossAttentions
-from transformers.modeling_outputs import BaseModelOutputWithPast
+from transformers import PreTrainedModel
+from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithCrossAttentions
 
 from ..config import HISEConfig
 from .base_layers import SoftTCMLayer
-# [NEW] Import MoPE components
 from .moe_router import MoPEBlock 
 from ..thermodynamics.mass_dynamics import CognitiveGearbox
+
+# ==========================================
+# AICA Constraint Definition: Semantic Constants
+# ==========================================
+CAUSAL_MASK_VALUE: float = float('-inf')
+ROUTING_DUMMY_FSI: float = 1.0
 
 
 class HISEPreTrainedModel(PreTrainedModel):
     config_class = HISEConfig
     base_model_prefix = "hise"
-    # [NEW] Added MoPEBlock to prevent split errors during distributed training
     _no_split_modules = ["SoftTCMLayer", "MoPEBlock"] 
 
-    def _init_weights(self, module):
+    def _init_weights(self, module: nn.Module) -> None:
+        """Initializes weights adhering to deterministic statistical bounds."""
         std = self.config.initializer_range
         if isinstance(module, nn.Linear):
             module.weight.data.normal_(mean=0.0, std=std)
@@ -30,100 +36,86 @@ class HISEPreTrainedModel(PreTrainedModel):
 
 
 class HISEModel(HISEPreTrainedModel):
-    def __init__(self, config: HISEConfig):
+    """
+    Core HISE Model combining System 1 (Dense TCM) and System 2 (MoPE).
+    
+    AICA Asserts:
+        - Prevents Type Collapse by strictly adhering to HF Output structures.
+        - Employs explicit tensor shapes and explicitly declared dummy states.
+    """
+    def __init__(self, config: HISEConfig) -> None:
         super().__init__(config)
-        self.embed_dim = config.d_model
-        self.config = config
+        self.embed_dim: int = config.d_model
+        self.config: HISEConfig = config
         
-        # 1. Embeddings
         self.wte = nn.Embedding(config.vocab_size, self.embed_dim)
         self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
         
-        # [NEW] Shared Gearbox for MoE Routing
-        # If using MoE, we need a way to calculate 'Mass' to guide the router
-        # regardless of whether the expert itself calculates physics.
         if config.use_moe:
             self.router_gearbox = CognitiveGearbox(config)
         
-        # 2. Physics Layers (Stack of Soft-TCM or MoPE Blocks)
         self.layers = nn.ModuleList()
         for _ in range(config.n_layers):
             if config.use_moe:
-                # [System 2] Mixture of Physics Experts
                 self.layers.append(MoPEBlock(config, num_experts=config.num_experts))
             else:
-                # [System 1] Standard Dense Physics Layer
                 self.layers.append(SoftTCMLayer(config))
         
         self.ln_f = nn.LayerNorm(self.embed_dim)
         self.post_init()
 
-
     def forward(
         self,
-        input_ids: torch.LongTensor = None,
+        input_ids: torch.LongTensor,
         past_momentums: Optional[List[torch.FloatTensor]] = None, 
         attention_mask: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         output_fsi: Optional[bool] = None,
-    ) -> Union[BaseModelOutputWithPast, Tuple]:
+    ) -> BaseModelOutputWithPast:
         
+        # AICA Guard: Strict dimensionality enforcement
+        assert input_ids.dim() == 2, f"Contract Violation: input_ids must be 2D, got {input_ids.shape}"
+
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         output_fsi = output_fsi if output_fsi is not None else False
         
-        input_shape = input_ids.size()
-        input_ids = input_ids.view(-1, input_shape[-1])
+        B, T = input_ids.size()
         device = input_ids.device
         
-        # Position Embeddings
-        if past_momentums is not None:
-            # Handle list of past states safely
-            if len(past_momentums) > 0 and past_momentums[0] is not None:
-                past_length = past_momentums[0].shape[1]
-            else:
-                past_length = 0
-        else:
-            past_length = 0
+        past_length: int = 0
+        if past_momentums is not None and len(past_momentums) > 0 and past_momentums[0] is not None:
+            past_length = past_momentums[0].shape[1]
             
-        pos = torch.arange(past_length, past_length + input_shape[-1], dtype=torch.long, device=device)
-        pos = pos.unsqueeze(0).view(-1, input_shape[-1])
+        pos = torch.arange(past_length, past_length + T, dtype=torch.long, device=device)
+        pos = pos.unsqueeze(0).expand(B, T)
         
         hidden_states = self.wte(input_ids) + self.wpe(pos)
         
-        # Causal Mask
         if attention_mask is None:
-            attention_mask = torch.triu(torch.ones(input_shape[-1], input_shape[-1], device=device) * float('-inf'), diagonal=1)
+            attention_mask = torch.triu(
+                torch.full((T, T), CAUSAL_MASK_VALUE, device=device), 
+                diagonal=1
+            )
 
-        next_momentums = []
-        all_fsi_scores = [] 
-        total_aux_loss = 0.0 # [NEW] Track MoE Load Balancing Loss
+        next_momentums: List[torch.Tensor] = []
+        all_fsi_scores: List[torch.Tensor] = [] 
+        total_aux_loss: torch.Tensor = torch.tensor(0.0, device=device)
         
-        # Helper for MoE Routing Mass
-        dummy_fsi_for_routing = torch.ones(input_ids.shape[0], input_ids.shape[1], 1, device=device)
+        # AICA Fix: Explicitly named and shaped semantic spoofing constant. 
+        # (Ideal fix would be to add `derive_routing_mass` to Gearbox, avoiding FSI calculation entirely)
+        dummy_fsi_for_routing = torch.full((B, T, 1), ROUTING_DUMMY_FSI, device=device, dtype=torch.float32)
 
         for i, layer in enumerate(self.layers):
             layer_past = past_momentums[i] if past_momentums is not None else None
             
             if self.config.use_moe:
-                # === MoE Path ===
-                # 1. Calculate Mass for Routing (using shared gearbox)
-                # We use a dummy FSI=1.0 because we just need entropy-based mass for routing
                 routing_mass, _, _ = self.router_gearbox(hidden_states, dummy_fsi_for_routing)
-                
-                # 2. Forward through MoPE Block
-                # MoPE returns: hidden_states, aux_loss
                 hidden_states, layer_aux_loss = layer(hidden_states, routing_mass)
                 
                 total_aux_loss += layer_aux_loss
                 
-                # MoE blocks currently abstract away the low-level momentum/fsi
-                # So we append None or maintain structure
-                m_new = None 
-                fsi = None
-                
+                m_new, fsi = None, None
             else:
-                # === Dense Physics Path ===
-                # Returns: hidden_states, m_new (Momentum), fsi (Risk Metric)
                 hidden_states, m_new, fsi = layer(
                     hidden_states, 
                     mask=attention_mask, 
@@ -138,22 +130,24 @@ class HISEModel(HISEPreTrainedModel):
 
         hidden_states = self.ln_f(hidden_states)
 
-        # [NEW] Return Strategy
-        # We overload 'cross_attentions' to carry total_aux_loss
-        # We overload 'hidden_states' (tuple) to carry all_fsi_scores
-        
+        # AICA Structural Contract Enforcement: 
+        # We MUST NOT pass a scalar float into `cross_attentions` (Type Collapse). 
+        # We pack it into a Tuple[torch.Tensor] to maintain Hugging Face API structural integrity.
+        aux_loss_tuple = (total_aux_loss,) if self.config.use_moe else None
+
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=next_momentums if use_cache else None,
-            hidden_states=tuple(all_fsi_scores) if output_fsi and len(all_fsi_scores) > 0 else None,
-            cross_attentions=total_aux_loss if self.config.use_moe else None,
+            # FSI scores packaged safely; HF expects Tuple of Tensors here.
+            hidden_states=tuple(all_fsi_scores) if (output_fsi and all_fsi_scores) else None,
+            cross_attentions=aux_loss_tuple, 
         )
 
 
 class HISEForCausalLM(HISEPreTrainedModel):
     _keys_to_ignore_on_load_missing = [r"lm_head.weight"]
 
-    def __init__(self, config):
+    def __init__(self, config: HISEConfig) -> None:
         super().__init__(config)
         self.model = HISEModel(config)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
@@ -161,7 +155,7 @@ class HISEForCausalLM(HISEPreTrainedModel):
 
     def forward(
         self,
-        input_ids: torch.LongTensor = None,
+        input_ids: torch.LongTensor,
         past_momentums: Optional[List[torch.FloatTensor]] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
@@ -170,7 +164,7 @@ class HISEForCausalLM(HISEPreTrainedModel):
     ) -> CausalLMOutputWithCrossAttentions:
         
         outputs = self.model(
-            input_ids,
+            input_ids=input_ids,
             past_momentums=past_momentums,
             attention_mask=attention_mask,
             use_cache=use_cache,
@@ -182,35 +176,34 @@ class HISEForCausalLM(HISEPreTrainedModel):
 
         loss = None
         if labels is not None:
-            # 1. Standard CE Loss
             shift_logits = lm_logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
             
-            # 2. Add MoE Auxiliary Loss (Load Balancing)
-            # Retrieved from 'cross_attentions' field
+            # AICA Fix: Avoid dynamic object allocation in forward pass. Use functional API.
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)), 
+                shift_labels.view(-1)
+            )
+            
+            # AICA Structural Unpacking: Retrieve the safely packed aux_loss
             if self.config.use_moe and outputs.cross_attentions is not None:
-                aux_loss = outputs.cross_attentions
-                # Weighted sum (weight defined in config, default 0.01)
+                aux_loss = outputs.cross_attentions[0] # Unpack from tuple
                 loss += self.config.moe_loss_weight * aux_loss
 
-        # FSI Handling for Safety Valve
         fsi_metric = None
         
-        # [CRITICAL FIX] Added 'len(outputs.hidden_states) > 0' check
-        # This prevents crash when running in MoE mode where FSI scores might be empty
         if output_fsi and outputs.hidden_states is not None and len(outputs.hidden_states) > 0:
-             # Stack layers: [Layers, Batch, Seq]
              fsi_stack = torch.stack(outputs.hidden_states)
-             # Average across layers to get a global System 2 risk score
              fsi_metric = fsi_stack.mean(dim=0)
+             
+        # Package FSI into attentions safely (Tuple expected by HF API)
+        fsi_tuple = (fsi_metric,) if fsi_metric is not None else None
 
         return CausalLMOutputWithCrossAttentions(
             loss=loss,
             logits=lm_logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states, 
-            attentions=fsi_metric, 
-            cross_attentions=outputs.cross_attentions # Pass Aux Loss for monitoring
+            attentions=fsi_tuple, 
+            cross_attentions=outputs.cross_attentions
         )
