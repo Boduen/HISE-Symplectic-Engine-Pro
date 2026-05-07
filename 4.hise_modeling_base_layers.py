@@ -1,17 +1,29 @@
+import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from typing import Optional, Tuple
 from ..config import HISEConfig
 from ..thermodynamics.mass_dynamics import CognitiveGearbox
 from ..kernels.triton_physics import fused_agi_update
+
+# ==========================================
+# AICA Constraint Definition: Physical & Numerical Constants
+# ==========================================
+FSI_NOISE_FLOOR: float = 1e-6
+FSI_SIGNAL_SCALE: float = 2.0
+MASS_NUMERICAL_EPSILON: float = 1e-6
 
 
 class HamiltonianAttention(nn.Module):
     """
     Computes the Conservative Force Field (-grad V) from LogSumExp potential.
     Uses standard Attention mechanism but interprets outputs as Physical Forces.
+    
+    AICA Asserts:
+        - Replaced magic scaling (0.5) with strict math.sqrt evaluation.
+        - Strict type hinting for inputs and masks.
     """
-    def __init__(self, config: HISEConfig):
+    def __init__(self, config: HISEConfig) -> None:
         super().__init__()
         self.head_dim = config.d_model // config.n_heads
         self.n_heads = config.n_heads
@@ -21,16 +33,18 @@ class HamiltonianAttention(nn.Module):
         self.w_k = nn.Linear(config.d_model, config.d_model, bias=False)
         self.w_v = nn.Linear(config.d_model, config.d_model, bias=False)
         self.out_proj = nn.Linear(config.d_model, config.d_model)
+        
+        # AICA Fix: Explicit scaling constant to prevent semantic collapse
+        self.scale_factor = math.sqrt(self.head_dim)
 
-    def forward(self, h, mask=None):
+    def forward(self, h: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         B, T, C = h.size()
         q = self.w_q(h).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         k = self.w_k(h).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = self.w_v(h).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
 
         # Potential Gradient Calculation (Hamiltonian Dynamics)
-        # Scaled Dot-Product Attention
-        scores = (q @ k.transpose(-2, -1)) / self.head_dim**0.5
+        scores = (q @ k.transpose(-2, -1)) / self.scale_factor
         
         # Apply Temperature (Annealing)
         scores = scores / self.tau 
@@ -41,8 +55,6 @@ class HamiltonianAttention(nn.Module):
         attn_weights = torch.softmax(scores, dim=-1)
         
         # Force Accumulation
-        # In HISE, the attention output is interpreted as the "Force" exerted 
-        # by past tokens on the current token.
         force = attn_weights @ v 
         force = force.transpose(1, 2).contiguous().view(B, T, C)
         
@@ -52,15 +64,19 @@ class HamiltonianAttention(nn.Module):
 class SoftTCMLayer(nn.Module):
     """
     SR-TCM Layer v2 (Symplectic Recurrent Low-Rank Manifold).
-    Integrates Low-Rank Symplectic Dynamics with Cognitive Gearbox (System 1/2).
+    Integrates Low-Rank Symplectic Dynamics with Cognitive Gearbox.
+    
+    AICA Asserts:
+        - Strict topology bounds (unsqueeze explicit dimensions).
+        - Explicit Dependency Injection for Temporal States (past_momentum).
     """
-    def __init__(self, config: HISEConfig):
+    def __init__(self, config: HISEConfig) -> None:
         super().__init__()
         self.config = config
         self.force_field = HamiltonianAttention(config)
         self.norm = nn.LayerNorm(config.d_model)
 
-        # Low-Rank Manifold Projectors (U: Down to Manifold, V: Up to State Space)
+        # Low-Rank Manifold Projectors
         self.U = nn.Linear(config.d_model, config.d_inertial, bias=False)
         self.V = nn.Linear(config.d_inertial, config.d_model, bias=False)
 
@@ -70,90 +86,83 @@ class SoftTCMLayer(nn.Module):
             nn.Sigmoid()
         )
         
-        # AGI Core: Cognitive Gearbox
-        # Dynamically calculates Mass and Time-step (epsilon)
         self.gearbox = CognitiveGearbox(config)
         
-        # System 2 Logic Gate (Spectral-Riemannian Coupling)
+        # System 2 Logic Gate
         self.logic_gate = nn.Sequential(
             nn.Linear(config.d_model, config.d_model * 4),
             nn.GELU(),
             nn.Linear(config.d_model * 4, config.d_model)
         )
         
-        # Standard Drift / Mixing Layer
         self.mlp = nn.Sequential(
             nn.Linear(config.d_model, 4 * config.d_model),
             nn.GELU(),
             nn.Linear(4 * config.d_model, config.d_model)
         )
 
-    def forward(self, h, mask=None, past_momentum=None):
-        """
-        Symplectic Forward Pass with Differentiable Physics Metrics.
-        Handles both Inference (Cached) and Training (Fused Scan).
-        """
+    def forward(
+        self, 
+        h: torch.Tensor, 
+        mask: Optional[torch.Tensor] = None, 
+        past_momentum: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         h_norm = self.norm(h)
         B, T, C = h.shape
         
         # 1. Total Force Calculation
         f_attn = self.force_field(h_norm, mask)
-        f_conf = -self.config.lambda_conf * h_norm # Harmonic Confinement Force
+        f_conf = -self.config.lambda_conf * h_norm 
         f_total = f_attn + f_conf
         
-        # 2. Projection to Inertial Manifold (Phase Space)
+        # 2. Projection to Inertial Manifold
         f_proj = self.U(f_total) 
         
-        # 3. FSI Calculation (Differentiable!)
-        # Now part of the computational graph, enabling Physics Loss backprop.
+        # 3. FSI Calculation
         h_mag = torch.norm(h_norm, p=2, dim=-1)
         f_mag = torch.norm(f_proj, p=2, dim=-1)
         
-        # FSI = Signal / (Noise + epsilon)
-        fsi = h_mag / (2 * f_mag + 1e-6)
+        # AICA Fix: Inject explicit constants
+        fsi_raw = h_mag / (FSI_SIGNAL_SCALE * f_mag + FSI_NOISE_FLOOR)
+        
+        # AICA Strict Contract: Prevent Implicit Broadcasting (Type Collapse)
+        # Force FSI to be [Batch, Seq, 1] BEFORE passing to gearbox or physics kernel
+        fsi = fsi_raw.unsqueeze(-1) 
 
-        # 4. Cognitive Gearbox (Determine Mass & Epsilon)
+        # 4. Cognitive Gearbox
         mass_t, epsilon_t, is_system_2 = self.gearbox(h, fsi)
         gamma = self.gamma_net(h_norm)
 
-        # 5. Symplectic Integration (Momentum Update)
-        if past_momentum is not None:
-            # === Inference Mode (Cached) ===
-            # Use Manual Python Math for lowest latency on single steps.
-            # Kernel launch overhead > Computation time for seq_len=1.
-            
-            # Slice last step scalars
+        # 5. Symplectic Integration
+        # AICA Guard: Differentiate clearly between cached step and full sequence
+        is_single_step = (T == 1) and (past_momentum is not None)
+
+        if is_single_step:
+            # === Inference Mode (Cached, Single Step) ===
             eps_t = epsilon_t[:, -1:, :]
-            mass_t = mass_t[:, -1:, :]
+            mass_t_slice = mass_t[:, -1:, :]
             gam_t = gamma[:, -1:, :]
             
-            # Recurrence: m_t = alpha * m_{t-1} + beta * f_t
             alpha = 1.0 - (eps_t * gam_t)
-            beta = eps_t / (mass_t + 1e-6)
+            beta = eps_t / (mass_t_slice + MASS_NUMERICAL_EPSILON)
             
             m_new = alpha * past_momentum + beta * f_proj
         
         else:
-            # === Training Mode (Fused Scan) ===
-            # Call Triton Fused Kernel. 
-            # This replaces the Python loop with a parallel scan in SRAM.
-            # past_momentum is None implies cold start (h0=0).
-            m_new = fused_agi_update(None, f_proj, mass_t, epsilon_t, gamma)
+            # === Training Mode / Pre-fill Mode (Fused Scan) ===
+            # AICA Fix: Adhere to the strict positional argument contract of fused_agi_update
+            m_new = fused_agi_update(f_proj, mass_t, epsilon_t, gamma, past_momentum)
         
         # 6. Velocity Injection & Position Update
-        # q_{t+1} = q_t + epsilon * (V @ m_{t+1})
         velocity = self.V(m_new)
         h_new = h + epsilon_t * velocity
         
-        # 7. Spectral Coupling (System 2 Logic Injection)
-        # Soft Gating: Applies logic correction based on Mass excess
+        # 7. Spectral Coupling
         sys2_correction = self.logic_gate(self.norm(h_new))
-        
-        # Differentiable Gate
         gate = torch.sigmoid(mass_t - self.config.system2_threshold) 
         h_final = h_new + gate * sys2_correction
         
-        # 8. Auxiliary Drift (ResNet connection)
+        # 8. Auxiliary Drift
         h_final = h_final + self.mlp(self.norm(h_final))
 
         return h_final, m_new, fsi
