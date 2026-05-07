@@ -1,167 +1,143 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple, Optional
+from typing import Tuple
+
+from ..config import HISEConfig
+
+# ==========================================
+# AICA Constraint Definition: Semantic Constants
+# ==========================================
+class MoEConstants:
+    MLP_EXPANSION_FACTOR: int = 4
+    MIN_MASS_EPSILON: float = 1e-6
 
 
 class PhysicsRouter(nn.Module):
     """
     Implements 'Thermodynamic Routing' with Load Balancing.
-    [FIXED]: 
-    1. Removed hard-coded logic (+5.0).
-    2. Added learnable physics bias.
-    3. Implemented Load Balancing Loss to prevent expert collapse.
+    
+    AICA Asserts:
+        - Strict adherence to config contracts (num_experts_per_tok).
+        - Explicit dimensional asserts to prevent implicit broadcasting.
     """
-    def __init__(self, config, num_experts: int = 4):
+    def __init__(self, config: HISEConfig) -> None:
         super().__init__()
-        self.d_model = config.d_model
-        self.num_experts = num_experts
-        
+        # AICA Precondition: Prevent invalid topologies
+        assert config.num_experts > 0, "Contract Violation: num_experts must be positive."
+        assert config.num_experts_per_tok > 0, "Contract Violation: num_experts_per_tok must be positive."
+        assert config.num_experts_per_tok <= config.num_experts, "Contract Violation: top_k cannot exceed num_experts."
+
+        self.d_model: int = config.d_model
+        self.num_experts: int = config.num_experts
+        self.top_k: int = config.num_experts_per_tok
+
         # Router Gate: Projects input to expert logits
-        self.gate = nn.Linear(config.d_model, num_experts, bias=False)
-        
-        # [NEW] Learnable Physics Bias
-        # Instead of hard-coding "Mass > Threshold -> Expert 3", we let the model learn
-        # how Mass impacts expert selection.
-        # Shape: [Num_Experts] - Each expert has a sensitivity to Semantic Mass
-        self.mass_bias = nn.Parameter(torch.zeros(num_experts))
+        self.gate = nn.Linear(config.d_model, self.num_experts, bias=False)
 
+        # Learnable Physics Bias: Sensitivity to Semantic Mass
+        self.mass_bias = nn.Parameter(torch.zeros(self.num_experts, dtype=torch.float32))
 
-    def forward(self, hidden_states: torch.Tensor, mass: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(
+        self, 
+        hidden_states: torch.Tensor, 
+        mass: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             hidden_states: [Batch, Seq, Dim]
-            mass: [Batch, Seq, 1] - The Semantic Mass derived from PSD.
-        
-        Returns:
-            router_logits: [Batch*Seq, Num_Experts]
-            expert_indices: [Batch*Seq, TopK]
-            aux_loss: Scalar tensor for load balancing
+            mass: [Batch, Seq, 1]
         """
+        # AICA Guard: Strict Topology Contracts
+        assert hidden_states.dim() == 3, f"Contract Violation: hidden_states must be 3D, got {hidden_states.shape}"
+        assert mass.dim() == 3 and mass.size(-1) == 1, f"Contract Violation: mass must be [B, S, 1], got {mass.shape}"
+
         B, T, C = hidden_states.shape
         flat_hidden = hidden_states.view(-1, C)
         flat_mass = mass.view(-1, 1)
 
-
         # 1. Base Routing Logits
-        logits = self.gate(flat_hidden) # [N, Num_Experts]
-        
-        # 2. Apply Physics Bias (Learnable)
-        # We scale the mass influence. If mass is high, it boosts experts with high mass_bias.
-        # This preserves the "System 1/2" intent but makes it differentiable.
+        logits = self.gate(flat_hidden)
+
+        # 2. Apply Differentiable Physics Bias
         physics_impact = flat_mass * self.mass_bias.unsqueeze(0)
         logits = logits + physics_impact
-        
-        # 3. Calculate Load Balancing Loss (Auxiliary Loss)
-        # Reference: Switch Transformer / Mixtral paper
+
+        # 3. Load Balancing & Top-K Selection
         probs = F.softmax(logits, dim=-1)
         
-        # limit top_k selection
-        top_k = 2
-        top_k_weights, top_k_indices = torch.topk(probs, top_k, dim=-1)
-        
-        # Calculate Aux Loss (Coefficient usually 0.01 - 0.1 in main loop)
-        # Importance: Sum of probabilities assigned to each expert
-        expert_importance = probs.sum(0)
-        # Load: Count of tokens assigned to each expert (approximate via gradients)
-        # We use a soft proxy for load to keep it differentiable or just use importance variance
-        # Here we implement the standard "Mean Squared importance" to encourage uniformity
-        target_load = probs.size(0) / self.num_experts
+        # AICA Fix: Utilize config-injected top_k instead of magic number
+        top_k_weights, top_k_indices = torch.topk(probs, self.top_k, dim=-1)
+
+        # Aux Loss: Mean Squared Importance (Encourages Uniformity)
+        expert_importance = probs.sum(dim=0)
+        target_load = float(probs.size(0)) / self.num_experts
         aux_loss = ((expert_importance - target_load) ** 2).mean()
-        
+
         return logits, top_k_indices, aux_loss, top_k_weights
 
 
 class MoPEBlock(nn.Module):
     """
     A Mixture-of-Experts block where experts are specialized Physics Engines.
+    
+    AICA Asserts:
+        - Deterministic Gradient Accumulation (Avoids raw in-place indexing where possible).
+        - Semantic constants extracted to MoEConstants.
     """
-    def __init__(self, config, num_experts=4):
+    def __init__(self, config: HISEConfig) -> None:
         super().__init__()
-        self.router = PhysicsRouter(config, num_experts)
+        self.config: HISEConfig = config
+        self.num_experts: int = config.num_experts
         
-        # Experts: Can be specialized MLPs or SoftTCMLayers
+        self.router = PhysicsRouter(config)
+
+        # AICA Fix: Replaced magic number '4' with explicit ML_EXPANSION_FACTOR
+        expanded_dim = MoEConstants.MLP_EXPANSION_FACTOR * config.d_model
+        
         self.experts = nn.ModuleList([
             nn.Sequential(
-                nn.Linear(config.d_model, 4 * config.d_model),
+                nn.Linear(config.d_model, expanded_dim),
                 nn.GELU(),
-                nn.Linear(4 * config.d_model, config.d_model)
-            ) for _ in range(num_experts)
+                nn.Linear(expanded_dim, config.d_model)
+            ) for _ in range(self.num_experts)
         ])
+
+    def forward(
+        self, 
+        hidden_states: torch.Tensor, 
+        mass: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         
-    def forward(self, hidden_states, mass):
-        """
-        Returns:
-            output: [Batch, Seq, Dim]
-            aux_loss: Scalar
-        """
         B, T, C = hidden_states.shape
         flat_hidden = hidden_states.view(-1, C)
-        
-        # 1. Route
-        logits, indices, aux_loss, weights = self.router(flat_hidden, mass)
-        
-        # 2. Dispatch & Execute
-        final_output = torch.zeros_like(flat_hidden)
-        
-        # Naive Loop (Compatible with standard PyTorch)
-        # For production speedup, use 'torch.scatter_add' or Triton Permutation
-        for i, expert in enumerate(self.experts):
-            # Identification: Which tokens chose this expert?
-            # indices: [N, TopK]
-            
-            # Mask for 1st choice
-            mask1 = (indices[:, 0] == i)
-            # Mask for 2nd choice
-            mask2 = (indices[:, 1] == i)
-            
-            combined_mask = mask1 | mask2
-            
-            if combined_mask.any():
-                # Extract tokens for this expert
-                # Note: This slicing is slow but functionally correct for training
-                selected_tokens = flat_hidden[combined_mask]
-                
-                # Expert Forward
-                expert_out = expert(selected_tokens)
-                
-                # Scatter back results
-                # We need to multiply by the routing weight
-                
-                # Handle 1st choice weights
-                if mask1.any():
-                    # Get weights for tokens where this expert was 1st choice
-                    # We need to map back carefully.
-                    # For simplicity in this naive impl, we iterate full batch logic:
-                    w1 = weights[mask1, 0].unsqueeze(-1)
-                    # We need to subset expert_out corresponding to mask1
-                    # This naive loop logic is complex to get perfectly right in 20 lines without scatter
-                    # So we use the "Zero Masking" approach for readability:
-                    
-                    # Full batch forward (Wasteful but correct graph) * Mask
-                    # Ideally, use Megablocks or scatter/gather.
-                    pass 
 
-        # --- Efficient Dispatch Implementation (Replacing Naive Loop) ---
-        # Reshape to [N, TopK, C] to handle weights easily
-        # But since experts are standard NN modules, we process expert-by-expert
-        
+        # 1. Route
+        logits, indices, aux_loss, weights = self.router(hidden_states, mass)
+
+        # 2. Dispatch & Execute
+        # AICA Fix: Use explicit cloning/zeroing to ensure a clean deterministic computational graph
         results = torch.zeros_like(flat_hidden)
-        
-        for k in range(2): # For Top-1 and Top-2
-            expert_idx = indices[:, k] # [N]
-            w = weights[:, k].unsqueeze(-1) # [N, 1]
-            
+
+        # Loop over the allowed Top-K choices defined in config
+        for k in range(self.config.num_experts_per_tok):
+            expert_idx = indices[:, k] 
+            w = weights[:, k].unsqueeze(-1) 
+
             for e_idx, expert in enumerate(self.experts):
-                # Boolean mask for tokens that selected expert e_idx at rank k
                 token_mask = (expert_idx == e_idx)
-                
+
                 if token_mask.any():
+                    # Extract inputs for this expert
                     inp = flat_hidden[token_mask]
                     out = expert(inp)
-                    # Accumulate: results[masked] += weight * output
-                    # In-place add with masking requires index_put or scatter
-                    # We use a masked add for simplicity
-                    results[token_mask] += w[token_mask] * out
                     
+                    # Weight the output
+                    weighted_out = out * w[token_mask]
+                    
+                    # AICA Safety Constraint: To strictly prevent non-deterministic in-place accumulation 
+                    # during backward pass (scatter reduce), we use the masked accumulation strictly.
+                    # In production Triton kernels, this is handled via atomic adds.
+                    results[token_mask] = results[token_mask] + weighted_out
+
         return results.view(B, T, C), aux_loss
